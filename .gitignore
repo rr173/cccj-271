@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+out/
+generated_fixtures/
+.pytest_cache/
