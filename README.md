@@ -22,6 +22,16 @@ python3 -I /workspace/roster.py reconstruct \
 
 # 测试
 python3 -I /workspace/test_roster_reconstruct.py
+python3 -I /workspace/test_archive.py
+
+# 清册档案端到端可复跑验证
+python3 -I /workspace/verify_archive.py
+
+# 清册档案：入档与单格查询
+python3 -I /workspace/roster.py ingest --archive /workspace/out/archive.sqlite3 \
+  --batch 1 --effective-date 2026-01-01 --roster /path/to/roster.jsonl
+python3 -I /workspace/roster.py query --archive /workspace/out/archive.sqlite3 \
+  --cutoff 1 --date 2026-01-15 --row R1 --col name
 ```
 
 省略 `--rows-out` 时，业务行 JSONL 写到标准输出；摘要写到 stderr。
@@ -155,6 +165,103 @@ Visible  = W \ Occluded
 
 错误只包含页号、JSONL 行号、单元 ID、违规坐标轴等定位/几何信息，不回显原始
 词记录或词文本。未预期异常也只返回异常类型，避免原始异常/回溯回显源数据。
+
+## 清册档案与单格查询
+
+公示清册有时迟到或补正。档案要能回答：**截至某次入档，我们对某个业务日期
+的这一格知道什么？** 复用上面的页面描述与可见性判定：每份清册先按 `reconstruct`
+规则算成安全单元，只有“可判”的文本进入档案；`undecidable` 只有状态和几何
+原因码，被遮词文本与词框一律不进入档案、临时文件或诊断。
+
+### 入档
+
+```bash
+python3 -I /workspace/roster.py ingest --archive ARCHIVE.sqlite3 \
+  --batch 7 --effective-date 2026-03-01 --roster roster.jsonl
+python3 -I /workspace/roster.py ingest --archive ARCHIVE.sqlite3 \
+  --batch 8 --effective-date 2026-02-10 --action retract
+python3 -I /workspace/roster.py batches --archive ARCHIVE.sqlite3
+```
+
+- `--batch`：每次被接受的入档给出**严格递增的正整数批号**。
+- `--effective-date`：该册的生效日期，`YYYY-MM-DD`，必须是真实日历日期。
+- `--action submit`（默认）：提交该日期的一份清册。**再次提交同一日期时，
+  新册整体取代该日上一份**，不继承旧册中未出现的格。
+- `--action retract`：撤回该日期当前有效的清册；成功后该日期不再提供事实，
+  之后可以重新提交。对该日期已无可撤回册时报错。
+- 生效日期**不必按入档顺序递增**，可以补录更早业务日期的清册。
+- 坏清册（页面描述错误）、非递增批号、无有效册可撤回时，命令以退出码 `2`
+  报告安全 JSON 错误，**档案内容与可查询批号都不变**。批号去重在同一事务内
+  完成，失败不会留下半个批次。提交一份没有声明任何业务格的空清册也会被
+  拒绝（要清空某日请用 `retract`）。
+
+入档成功时 stdout 输出安全摘要，例如：
+
+```json
+{"status":"ok","action":"submit","batch_no":7,"effective_date":"2026-03-01","cell_count":120,"removed_cell_count":0,"archive":"ARCHIVE.sqlite3"}
+```
+
+### 单格查询
+
+```bash
+python3 -I /workspace/roster.py query --archive ARCHIVE.sqlite3 \
+  --cutoff 7 --date 2026-03-15 --row R1 --col name
+```
+
+- `--cutoff`：截止批号。只看“该批号当时已入档”的册；之后的新入档不会
+  改变旧截止批号的答案。
+- `--date`：业务日期。
+- `--row` / `--col`：业务 `row_id` / `col_id`。
+
+在截止批号当时有效的各册中，取**不晚于业务日期、且包含该格**的最近生效日期。
+当前日期没有该格时，才向更早生效日期找。**空白和不可判都是实际结果**：
+
+- 最近的一份含格册里是 `blank`，就返回 `blank` 加空文本；
+- 是 `undecidable`，就返回 `undecidable`、`text: null` 和原因码；
+- 两者都不会被更早的旧值填回。
+
+找到时返回结果、允许公开的值，以及来源清册的 `effective_date`、`ingest_batch_no`、
+`page_id`/`page_no` 和 `cell_id`。找不到时明确返回无记录：
+
+```json
+{"record_type":"archive_cell","cutoff_batch_no":7,"business_date":"2026-03-15",
+ "row_id":"R1","col_id":"name","found":false,"result":"no_record"}
+```
+
+成功结果示例（`undecidable` 时没有 `text`，只有 `reasons`）：
+
+```json
+{"record_type":"archive_cell","cutoff_batch_no":7,"business_date":"2026-03-15",
+ "row_id":"R1","col_id":"name","found":true,"status":"ok","text":"公开 清册",
+ "effective_date":"2026-03-01","ingest_batch_no":7,
+ "page_id":"P1","page_no":1,"cell_id":"r1c1","row_no":1,"col_no":1}
+```
+
+### 长期积累与性能
+
+- 档案是双时间存储：业务时间 `effective_date`，入档时间 `batch_no`。
+- 每个业务格维护一棵**持久化有序映射** `生效日期 -> 安全事实`，批号只追加、
+  不改旧节点。因此任意旧截止批号都保留原答案。
+- 查询 = 一次按 `(cell, batch)` 的根指针索引查找 + 一次有序映射的前驱下降，
+  不逐版回放、不扫描该格的完整历史。
+- 补正或撤回只重写**本次涉及格**的映射根：新批号只追加本批实际变化的格，
+  未涉及的格不产生新版本，也不做全档重建。
+- 入档在单个 SQLite 事务里完成；失败整体回滚。
+
+### 程序接口
+
+```python
+from roster_reconstruct import ingest, query
+
+ingest("archive.sqlite3", batch_no=1, effective_date="2026-01-01",
+       roster_path="roster.jsonl")
+query("archive.sqlite3", cutoff_batch_no=1, business_date="2026-01-15",
+      row_id="R1", col_id="name")
+```
+
+`/workspace/verify_archive.py` 会用真实 CLI 复跑入档顺序颠倒、整体取代、
+撤回与重提、错误入档不改档和隐私断言；`/workspace/test_archive.py` 另有
+随机模型对照与查询步数断言。
 
 ## 大页册与内存/性能
 

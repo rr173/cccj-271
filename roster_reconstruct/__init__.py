@@ -1,5 +1,6 @@
 """Reconstruct visible roster rows from vector page descriptions."""
 
+from .archive import ArchiveStore, ingest, list_batches, query
 from .book import (
     BookStreamProcessor,
     iter_business_rows,
@@ -13,6 +14,7 @@ from .engine import (
     PageBuilder,
 )
 from .errors import (
+    ArchiveError,
     DuplicateCellError,
     PageDescriptionError,
     RosterError,
@@ -20,6 +22,8 @@ from .errors import (
 from .staging import StagingStore
 
 __all__ = [
+    "ArchiveError",
+    "ArchiveStore",
     "BookStreamProcessor",
     "CROSS_BOUNDARY_REASON",
     "DuplicateCellError",
@@ -28,10 +32,13 @@ __all__ = [
     "PageDescriptionError",
     "RosterError",
     "StagingStore",
+    "ingest",
     "iter_business_rows",
+    "list_batches",
     "process_jsonl",
     "process_page_description",
+    "query",
     "write_jsonl",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

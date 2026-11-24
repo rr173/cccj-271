@@ -321,6 +321,56 @@ def write_large_book(
     return path
 
 
+def write_dated_roster(
+    path: str | Path,
+    *,
+    page_id: str = "P1",
+    cells: list[dict[str, Any]],
+) -> Path:
+    """Write a one-page roster for archive ingest tests.
+
+    ``cells`` entries look like::
+
+        {"row_id": "R1", "col_id": "name", "rect": [0, 0, 200, 60],
+         "words": [{"text": "visible", "rect": [10, 10, 90, 40]}],
+         "blanks": [[10, 10, 40, 40]]}
+
+    A ``words`` entry may set ``secret`` to a covered source word; it is a
+    normal primitive, so the reconstruction rules decide what stays visible.
+    """
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    width = max((c["rect"][2] for c in cells), default=100)
+    height = max((c["rect"][3] for c in cells), default=100)
+
+    with path.open("w", encoding="utf-8") as fh:
+        _write(fh, {"type": "page_start", "page_id": page_id,
+                    "page_no": 1, "bounds": [0, 0, width, height]})
+        for index, cell in enumerate(cells):
+            _write(
+                fh,
+                {
+                    "type": "cell",
+                    "cell_id": cell.get("cell_id", f"{page_id}-cell-{index}"),
+                    "row_id": cell["row_id"],
+                    "col_id": cell["col_id"],
+                    "row_no": cell.get("row_no"),
+                    "col_no": cell.get("col_no"),
+                    "reading_order": index + 1,
+                    "rect": cell["rect"],
+                },
+            )
+        for cell in cells:
+            for word in cell.get("words", []):
+                _write(fh, {"type": "word", "text": word["text"],
+                            "rect": word["rect"]})
+            for blank_rect in cell.get("blanks", []):
+                _write(fh, {"type": "blank", "rect": blank_rect})
+        _write(fh, {"type": "page_end", "page_id": page_id})
+    return path
+
+
 def write_bad_fixtures(outdir: str | Path) -> dict[str, Path]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)

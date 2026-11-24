@@ -46,6 +46,12 @@ class StagingError(RosterError):
     code = "staging_error"
 
 
+class ArchiveError(RosterError):
+    """A rejected archive ingest or an invalid archive lookup request."""
+
+    code = "archive_error"
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value

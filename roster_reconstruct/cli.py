@@ -26,6 +26,7 @@ from .fixtures import (
 )
 from .staging import StagingStore
 from .book import process_jsonl
+from . import archive
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -68,6 +69,46 @@ def _build_parser() -> argparse.ArgumentParser:
     fix.add_argument("--words-per-cell", type=int, default=4)
     fix.add_argument("--seed", type=int, default=20261124)
     fix.set_defaults(handler=_cmd_fixture)
+
+    ing = sub.add_parser(
+        "ingest", help="persistently submit or retract a dated roster"
+    )
+    ing.add_argument("--archive", required=True, help="archive SQLite path")
+    ing.add_argument(
+        "--batch", type=int, required=True, help="strictly increasing positive batch number"
+    )
+    ing.add_argument(
+        "--effective-date", required=True, help="roster effective date YYYY-MM-DD"
+    )
+    ing.add_argument(
+        "--action",
+        choices=("submit", "retract"),
+        default="submit",
+        help="submit a roster or retract the date's current valid roster",
+    )
+    ing.add_argument(
+        "--roster",
+        help="JSONL page description for --action submit (required for submit)",
+    )
+    ing.set_defaults(handler=_cmd_ingest)
+
+    qry = sub.add_parser(
+        "query", help="look up one business cell as of a batch cutoff"
+    )
+    qry.add_argument("--archive", required=True, help="archive SQLite path")
+    qry.add_argument(
+        "--cutoff", type=int, required=True, help="only batches up to this number apply"
+    )
+    qry.add_argument(
+        "--date", required=True, help="business date YYYY-MM-DD"
+    )
+    qry.add_argument("--row", required=True, help="business row_id")
+    qry.add_argument("--col", required=True, help="business col_id")
+    qry.set_defaults(handler=_cmd_query)
+
+    bat = sub.add_parser("batches", help="list accepted archive ingests")
+    bat.add_argument("--archive", required=True, help="archive SQLite path")
+    bat.set_defaults(handler=_cmd_batches)
     return parser
 
 
@@ -208,6 +249,99 @@ def _cmd_fixture(args: argparse.Namespace) -> int:
 
     print(json.dumps(generated, ensure_ascii=False), file=sys.stderr)
     return 0
+
+
+def _cmd_ingest(args: argparse.Namespace) -> int:
+    try:
+        result = archive.ingest(
+            args.archive,
+            batch_no=args.batch,
+            effective_date=args.effective_date,
+            action=args.action,
+            roster_path=args.roster,
+        )
+        print(json.dumps(result, ensure_ascii=False), file=sys.stdout)
+        return 0
+    except RosterError as exc:
+        print(json.dumps(exc.to_dict(), ensure_ascii=False), file=sys.stderr)
+        return 2
+    except OSError as exc:
+        error = {
+            "status": "error",
+            "error_code": "io_error",
+            "exception_type": type(exc).__name__,
+            "path": exc.filename,
+        }
+        print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - safe CLI boundary
+        error = {
+            "status": "error",
+            "error_code": "internal_error",
+            "exception_type": type(exc).__name__,
+        }
+        print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
+def _cmd_query(args: argparse.Namespace) -> int:
+    try:
+        result = archive.query(
+            args.archive,
+            cutoff_batch_no=args.cutoff,
+            business_date=args.date,
+            row_id=args.row,
+            col_id=args.col,
+        )
+        print(json.dumps(result, ensure_ascii=False), file=sys.stdout)
+        return 0
+    except RosterError as exc:
+        print(json.dumps(exc.to_dict(), ensure_ascii=False), file=sys.stderr)
+        return 2
+    except OSError as exc:
+        error = {
+            "status": "error",
+            "error_code": "io_error",
+            "exception_type": type(exc).__name__,
+            "path": exc.filename,
+        }
+        print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - safe CLI boundary
+        error = {
+            "status": "error",
+            "error_code": "internal_error",
+            "exception_type": type(exc).__name__,
+        }
+        print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
+def _cmd_batches(args: argparse.Namespace) -> int:
+    try:
+        result = archive.list_batches(args.archive)
+        print(json.dumps(result, ensure_ascii=False), file=sys.stdout)
+        return 0
+    except RosterError as exc:
+        print(json.dumps(exc.to_dict(), ensure_ascii=False), file=sys.stderr)
+        return 2
+    except OSError as exc:
+        error = {
+            "status": "error",
+            "error_code": "io_error",
+            "exception_type": type(exc).__name__,
+            "path": exc.filename,
+        }
+        print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - safe CLI boundary
+        error = {
+            "status": "error",
+            "error_code": "internal_error",
+            "exception_type": type(exc).__name__,
+        }
+        print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:
