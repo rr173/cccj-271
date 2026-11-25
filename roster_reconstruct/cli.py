@@ -106,6 +106,29 @@ def _build_parser() -> argparse.ArgumentParser:
     qry.add_argument("--col", required=True, help="business col_id")
     qry.set_defaults(handler=_cmd_query)
 
+    prv = sub.add_parser(
+        "preview",
+        help="read-only JSONL diff of what the next ingest would change",
+    )
+    prv.add_argument("--archive", required=True, help="archive SQLite path")
+    prv.add_argument(
+        "--batch", type=int, required=True, help="proposed next batch number"
+    )
+    prv.add_argument(
+        "--effective-date", required=True, help="proposed effective date YYYY-MM-DD"
+    )
+    prv.add_argument(
+        "--action",
+        choices=("submit", "retract"),
+        default="submit",
+        help="preview a roster submit or a retraction",
+    )
+    prv.add_argument(
+        "--roster",
+        help="JSONL page description for --action submit (required for submit)",
+    )
+    prv.set_defaults(handler=_cmd_preview)
+
     bat = sub.add_parser("batches", help="list accepted archive ingests")
     bat.add_argument("--archive", required=True, help="archive SQLite path")
     bat.set_defaults(handler=_cmd_batches)
@@ -294,6 +317,54 @@ def _cmd_query(args: argparse.Namespace) -> int:
             col_id=args.col,
         )
         print(json.dumps(result, ensure_ascii=False), file=sys.stdout)
+        return 0
+    except RosterError as exc:
+        print(json.dumps(exc.to_dict(), ensure_ascii=False), file=sys.stderr)
+        return 2
+    except OSError as exc:
+        error = {
+            "status": "error",
+            "error_code": "io_error",
+            "exception_type": type(exc).__name__,
+            "path": exc.filename,
+        }
+        print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - safe CLI boundary
+        error = {
+            "status": "error",
+            "error_code": "internal_error",
+            "exception_type": type(exc).__name__,
+        }
+        print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
+def _cmd_preview(args: argparse.Namespace) -> int:
+    try:
+        result = archive.preview(
+            args.archive,
+            batch_no=args.batch,
+            effective_date=args.effective_date,
+            action=args.action,
+            roster_path=args.roster,
+        )
+        # JSONL diffs on stdout, deterministic order; summary on stderr.
+        for record in result["records"]:
+            sys.stdout.write(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            )
+            sys.stdout.write("\n")
+        summary = {
+            "status": "ok",
+            "action": result["action"],
+            "batch_no": result["batch_no"],
+            "effective_date": result["effective_date"],
+            "changed_cell_count": result["changed_cell_count"],
+            "node_reads": result["node_reads"],
+            "archive": result["archive"],
+        }
+        print(json.dumps(summary, ensure_ascii=False), file=sys.stderr)
         return 0
     except RosterError as exc:
         print(json.dumps(exc.to_dict(), ensure_ascii=False), file=sys.stderr)

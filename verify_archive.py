@@ -18,6 +18,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import subprocess
 import sys
@@ -95,6 +96,30 @@ def query(db: Path, cutoff: int, date: str, row: str, col: str) -> dict:
     if code != 0:
         raise SystemExit(f"query failed ({code}): {err.strip()}")
     return json.loads(out)
+
+
+def preview(db: Path, batch: int, date: str, *,
+            action: str = "submit", roster: Path | None = None
+            ) -> tuple[int, list[dict], str, str]:
+    args = ["preview", "--archive", str(db), "--batch", str(batch),
+            "--effective-date", date, "--action", action]
+    if roster is not None:
+        args += ["--roster", str(roster)]
+    code, out, err = run(*args)
+    records = [json.loads(line) for line in out.splitlines() if line.strip()]
+    return code, records, out, err
+
+
+def _same_answer(got: dict, want: dict) -> bool:
+    if not got["found"]:
+        return want.get("found") is False and got["result"] == want.get("result")
+    keys = ("found", "status", "text", "effective_date", "ingest_batch_no",
+            "page_id", "page_no", "cell_id", "row_no", "col_no")
+    if any(got.get(k) != want.get(k) for k in keys):
+        return False
+    if "reasons" in want:
+        return got.get("reasons") == want["reasons"]
+    return "reasons" not in got
 
 
 class Checks:
@@ -229,9 +254,72 @@ def main() -> int:
         ingest(db, 6, "2026-01-01", roster=r1)
         checks.eq("re-submitted date", query(db, 6, "2026-01-01", "R1", "name")["text"], "一月")
 
+        # --- read-only impact preview ---------------------------------
+        # State right now: 2026-01-01 (name=一月, addr=旧地址),
+        # 2026-02-01 (name=新版, addr dropped), 2026-03-01
+        # (name=blank, addr=undecidable, extra=可公开).
+        bytes_before_preview = db.read_bytes()
+
+        # Preview a wholesale replacement of 2026-02-01 that drops `name` and
+        # adds `extra`.  `name` should fall back to 2026-01-01 for [02-01,
+        # 03-01); `extra` starts at 02-01 with no upper bound.
+        r7 = roster_file(workdir / "r7.jsonl", [
+            cell("R1", "extra", [0, 120, 200, 180], [("新格子", [10, 130, 90, 160])]),
+        ])
+        code, records, _out, err = preview(db, 7, "2026-02-01", roster=r7)
+        checks.eq("preview exit code", code, 0)
+        checks.eq("preview archive unchanged", db.read_bytes(), bytes_before_preview)
+        checks.eq("preview does not create the proposed batch",
+                  query(db, 7, "2026-02-01", "R1", "extra").get("result", "found"),
+                  "no_record")
+        by_col = {r["col_id"]: r for r in records}
+        checks.true("preview touches dropped name", "name" in by_col)
+        checks.true("preview touches new extra", "extra" in by_col)
+        checks.eq("preview name start", by_col["name"]["interval"]["start"],
+                  "2026-02-01")
+        checks.eq("preview name end at next roster", by_col["name"]["interval"]["end"],
+                  "2026-03-01")
+        checks.eq("preview name before", by_col["name"]["before"]["text"], "新版")
+        checks.eq("preview name after falls back", by_col["name"]["after"]["text"],
+                  "一月")
+        checks.eq("preview extra before", by_col["extra"]["before"],
+                  {"found": False, "result": "no_record"})
+        checks.eq("preview extra after", by_col["extra"]["after"]["text"], "新格子")
+        checks.eq("preview extra closes at 03-01 roster",
+                  by_col["extra"]["interval"]["end"], "2026-03-01")
+        checks.eq("preview summary count",
+                  json.loads(err)["changed_cell_count"], len(records))
+
+        # Invalid preview (non-increasing batch) must emit nothing and leave
+        # the archive byte-identical.
+        code, records_bad, out_bad, _err = preview(db, 6, "2026-02-01", roster=r7)
+        checks.eq("bad preview exit", code, 2)
+        checks.eq("bad preview no stdout", out_bad, "")
+        checks.eq("bad preview archive unchanged", db.read_bytes(), bytes_before_preview)
+
+        # Apply the same operation as batch 7 and confirm each previewed
+        # interval now matches real single-cell queries.
+        ingest(db, 7, "2026-02-01", roster=r7)
+        consistent = True
+        for record in records:
+            row_id, col_id = record["row_id"], record["col_id"]
+            positions = [("2026-02-01", record["after"])]
+            if record["interval"]["end"] is not None:
+                # Day just before the close still has the `after` answer.
+                end = datetime.date.fromisoformat(record["interval"]["end"])
+                day = (end - datetime.timedelta(days=1)).isoformat()
+                positions.append((day, record["after"]))
+            for date, want in positions:
+                got = query(db, 7, date, row_id, col_id)
+                if not _same_answer(got, want):
+                    consistent = False
+        checks.true("preview matches actual ingest", consistent)
+        checks.eq("old cutoff 6 unchanged by batch 7",
+                  query(db, 6, "2026-02-01", "R1", "name")["text"], "新版")
+
         # --- privacy --------------------------------------------------
         outputs.append(json.dumps(batches_after, ensure_ascii=False))
-        for cutoff in range(0, 7):
+        for cutoff in range(0, 8):
             for date in ("2026-01-01", "2026-02-01", "2026-03-01"):
                 for col in ("name", "addr", "extra"):
                     outputs.append(json.dumps(

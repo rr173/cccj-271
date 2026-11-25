@@ -1,6 +1,6 @@
 """Reconstruct visible roster rows from vector page descriptions."""
 
-from .archive import ArchiveStore, ingest, list_batches, query
+from .archive import ArchiveStore, ingest, list_batches, preview, query
 from .book import (
     BookStreamProcessor,
     iter_business_rows,
@@ -37,6 +37,7 @@ __all__ = [
     "list_batches",
     "process_jsonl",
     "process_page_description",
+    "preview",
     "query",
     "write_jsonl",
 ]

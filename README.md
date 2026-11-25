@@ -23,15 +23,18 @@ python3 -I /workspace/roster.py reconstruct \
 # 测试
 python3 -I /workspace/test_roster_reconstruct.py
 python3 -I /workspace/test_archive.py
+python3 -I /workspace/test_archive_preview.py
 
 # 清册档案端到端可复跑验证
 python3 -I /workspace/verify_archive.py
 
-# 清册档案：入档与单格查询
+# 清册档案：入档、单格查询与只读影响预览
 python3 -I /workspace/roster.py ingest --archive /workspace/out/archive.sqlite3 \
   --batch 1 --effective-date 2026-01-01 --roster /path/to/roster.jsonl
 python3 -I /workspace/roster.py query --archive /workspace/out/archive.sqlite3 \
   --cutoff 1 --date 2026-01-15 --row R1 --col name
+python3 -I /workspace/roster.py preview --archive /workspace/out/archive.sqlite3 \
+  --batch 2 --effective-date 2026-02-01 --roster /path/to/next.jsonl
 ```
 
 省略 `--rows-out` 时，业务行 JSONL 写到标准输出；摘要写到 stderr。
@@ -237,6 +240,65 @@ python3 -I /workspace/roster.py query --archive ARCHIVE.sqlite3 \
  "page_id":"P1","page_no":1,"cell_id":"r1c1","row_no":1,"col_no":1}
 ```
 
+### 只读影响预览
+
+在真正提交或撤回之前，档案员可以先问：**下一批入档会让哪些按日期查询的单格
+答案改变？**
+
+```bash
+python3 -I /workspace/roster.py preview --archive ARCHIVE.sqlite3 \
+  --batch 9 --effective-date 2026-03-01 --roster next.jsonl
+python3 -I /workspace/roster.py preview --archive ARCHIVE.sqlite3 \
+  --batch 9 --effective-date 2026-02-10 --action retract
+```
+
+- 参数与 `ingest` 相同：`--batch`（拟用批号）、`--effective-date`、
+  `--action submit|retract`，submit 需 `--roster`。
+- **只读**：以只读方式打开档案，用与真实入档**完全相同**的重建与判定规则
+  验证拟提交清册，不写档案、不新增批次、不改任何旧截止批号的查询结果。输入
+  非法（批号非递增、无可撤回册、空清册、页面描述错误等）时，退出码 `2`、
+  stdout 为空、档案字节不变。
+- stdout 每行一条 `archive_impact` 差异记录（JSONL）；stderr 输出安全摘要
+  （含 `changed_cell_count` 与 `node_reads`）。
+
+每受影响的业务格给出**一段**按业务日期的最大连续半开区间 `[start, end)`：
+
+- `start` 是拟操作的生效日期 `D`；`end` 是该格在此档案中**下一份未被本操作
+  替换的生效清册日期**；该格之后没有记录时 `end` 为 `null`（无上界）。
+- 区间内任意业务日期的答案都与实际入档后的单格查询一致。因为本操作只重写
+  日期 `D`，`D` 之后的日期在两份映射里相同，所以一格至多一段区间。
+- `before` 是操作前、`after` 是操作后在该区间起点处按现有查询规则得到的
+  答案：状态、可公开文本、来源（`effective_date`/`ingest_batch_no`/页/格），
+  以及不可判时的原因码。**无记录**用 `{"found": false, "result": "no_record"}`
+  表示。空白（`blank`，`text: ""`）、不可判（`undecidable`，`text: null`）与
+  无记录三者严格区分。
+- **只有答案不同**（含来源不同）的格才输出。行按 `(row_id, col_id, start,
+  end)` 稳定排序。
+- 隐私边界不变：不可判格只带原因码，被遮词文本与词框绝不进入预览输出。
+
+示例：
+
+```json
+{"record_type":"archive_impact","action":"submit","batch_no":9,"effective_date":"2026-03-01","row_id":"R1","col_id":"name","interval":{"start":"2026-03-01","end":"2026-04-01"},"before":{"found":true,"status":"ok","text":"旧值","effective_date":"2026-03-01","ingest_batch_no":7,"page_id":"P1","page_no":1,"cell_id":"P1-cell-0","row_no":1,"col_no":1},"after":{"found":true,"status":"ok","text":"新值","effective_date":"2026-03-01","ingest_batch_no":9,"page_id":"P1","page_no":1,"cell_id":"P1-cell-0","row_no":1,"col_no":1}}
+```
+
+预览不会逐日枚举日期，也不回放历史批次：它只遍历**本次涉及**的格（新清册的
+格 + 该生效日期当前已登记的格），每格做三次持久化映射下降（`≤ D` 的前驱、
+`< D` 的前驱、`> D` 的后继），因此工作量与树的 O(log n) 高度相关，
+`node_reads` 摘要可用于核对。实际按同一批次完成该操作后，逐日单格查询与预览
+一致（见验证脚本）。
+
+程序接口：
+
+```python
+from roster_reconstruct import preview
+
+result = preview("archive.sqlite3", batch_no=9, effective_date="2026-03-01",
+                 roster_path="next.jsonl")
+for record in result["records"]:
+    ...
+```
+
 ### 长期积累与性能
 
 - 档案是双时间存储：业务时间 `effective_date`，入档时间 `batch_no`。
@@ -251,17 +313,21 @@ python3 -I /workspace/roster.py query --archive ARCHIVE.sqlite3 \
 ### 程序接口
 
 ```python
-from roster_reconstruct import ingest, query
+from roster_reconstruct import ingest, preview, query
 
 ingest("archive.sqlite3", batch_no=1, effective_date="2026-01-01",
        roster_path="roster.jsonl")
+preview("archive.sqlite3", batch_no=2, effective_date="2026-01-15",
+        roster_path="next.jsonl")
 query("archive.sqlite3", cutoff_batch_no=1, business_date="2026-01-15",
       row_id="R1", col_id="name")
 ```
 
 `/workspace/verify_archive.py` 会用真实 CLI 复跑入档顺序颠倒、整体取代、
-撤回与重提、错误入档不改档和隐私断言；`/workspace/test_archive.py` 另有
-随机模型对照与查询步数断言。
+撤回与重提、错误入档不改档、只读影响预览（不改档 / 非法输入无输出 /
+预览与实际入档后逐日查询一致）和隐私断言；`/workspace/test_archive.py` 另有
+随机模型对照与查询步数断言，`/workspace/test_archive_preview.py` 覆盖预览的
+区间边界、排序、只读性与对数级工作量。
 
 ## 大页册与内存/性能
 

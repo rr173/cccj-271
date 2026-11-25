@@ -252,6 +252,9 @@ class ArchiveStore:
             ) from None
         self.conn = conn
         self.conn.row_factory = sqlite3.Row
+        # Number of persistent-map node rows read since construction/reset.
+        # Preview uses it to prove work is bounded by tree height, not history.
+        self.node_reads = 0
 
     def close(self) -> None:
         self.conn.close()
@@ -266,6 +269,7 @@ class ArchiveStore:
     # Persistent treap
     # ------------------------------------------------------------------
     def _node(self, node_id: int) -> sqlite3.Row:
+        self.node_reads += 1
         row = self.conn.execute(
             "SELECT node_id, key, fact_json, priority, left_id, right_id "
             "FROM nodes WHERE node_id = ?",
@@ -385,6 +389,35 @@ class ArchiveStore:
                 node_id = int(node["right_id"])
             else:
                 node_id = int(node["left_id"])
+        return best
+
+    def _predecessor_strict(self, root: int, bound: str) -> sqlite3.Row | None:
+        """Newest key ``< bound``; one descent."""
+
+        best: sqlite3.Row | None = None
+        node_id = root
+        while node_id != 0:
+            node = self._node(node_id)
+            if node["key"] < bound:
+                best = node
+                node_id = int(node["right_id"])
+            else:
+                node_id = int(node["left_id"])
+        return best
+
+    def _successor_strict(self, root: int, bound: str) -> sqlite3.Row | None:
+        """Smallest key ``> bound``; one descent.  This is where an interval
+        opened at *bound* closes for this cell."""
+
+        best: sqlite3.Row | None = None
+        node_id = root
+        while node_id != 0:
+            node = self._node(node_id)
+            if node["key"] > bound:
+                best = node
+                node_id = int(node["left_id"])
+            else:
+                node_id = int(node["right_id"])
         return best
 
     # ------------------------------------------------------------------
@@ -651,6 +684,214 @@ class ArchiveStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ------------------------------------------------------------------
+    # Read-only impact preview
+    # ------------------------------------------------------------------
+    def preview_operation(
+        self,
+        *,
+        batch_no: int,
+        effective_date: str,
+        action: str,
+        staging: StagingStore | None = None,
+    ) -> list[dict[str, Any]]:
+        """Simulate one submit/retract without touching the archive.
+
+        Work is bounded by the operation itself: the new roster's cells plus
+        the cells currently registered for *effective_date*.  For each such
+        cell we perform three treap descents (predecessor ``<= D``,
+        predecessor ``< D`` and successor ``> D``); we never enumerate
+        calendar days and never replay historical batches.
+
+        The returned records are already in deterministic order.
+        """
+
+        self.node_reads = 0
+        # Mirror ingest's acceptance checks; all are read-only SELECTs.
+        self._validate_next_batch(batch_no)
+
+        previous = self._date_cell_rows(effective_date)
+        records: list[dict[str, Any]] = []
+
+        if action == "submit":
+            if staging is None:
+                raise ArchiveError(
+                    "missing_roster",
+                    reason="submit requires a roster page description",
+                )
+            new_facts: list[tuple[str, str, dict[str, Any]]] = []
+            new_pairs: set[tuple[str, str]] = set()
+            for cell in staging.iter_cell_rows():
+                row_id = cell["row_id"]
+                col_id = cell["col_id"]
+                fact = _fact_from_cell(cell, batch_no=batch_no)
+                new_facts.append((row_id, col_id, fact))
+                new_pairs.add((row_id, col_id))
+
+            if not new_facts and not previous:
+                raise ArchiveError(
+                    "empty_roster",
+                    effective_date=effective_date,
+                    reason="a submitted roster declared no business cells",
+                )
+
+            for row_id, col_id, fact in new_facts:
+                record = self._preview_one_cell(
+                    cell_key_id=self._cell_key_id(row_id, col_id),
+                    row_id=row_id,
+                    col_id=col_id,
+                    effective_date=effective_date,
+                    batch_no=batch_no,
+                    action=action,
+                    new_fact=fact,
+                )
+                if record is not None:
+                    records.append(record)
+
+            for cell_key_id, row_id, col_id in previous:
+                if (row_id, col_id) in new_pairs:
+                    continue
+                record = self._preview_one_cell(
+                    cell_key_id=cell_key_id,
+                    row_id=row_id,
+                    col_id=col_id,
+                    effective_date=effective_date,
+                    batch_no=batch_no,
+                    action=action,
+                    new_fact=None,
+                )
+                if record is not None:
+                    records.append(record)
+        else:  # retract
+            if not previous:
+                raise ArchiveError(
+                    "no_roster_to_retract",
+                    effective_date=effective_date,
+                    reason="this effective date has no currently valid roster",
+                )
+            for cell_key_id, row_id, col_id in previous:
+                record = self._preview_one_cell(
+                    cell_key_id=cell_key_id,
+                    row_id=row_id,
+                    col_id=col_id,
+                    effective_date=effective_date,
+                    batch_no=batch_no,
+                    action=action,
+                    new_fact=None,
+                )
+                if record is not None:
+                    records.append(record)
+
+        records.sort(
+            key=lambda r: (
+                r["row_id"],
+                r["col_id"],
+                r["interval"]["start"],
+                r["interval"]["end"] or "",
+            )
+        )
+        return records
+
+    def _date_cell_rows(
+        self, effective_date: str
+    ) -> list[tuple[int, str, str]]:
+        rows = self.conn.execute(
+            "SELECT dc.cell_key_id AS cell_key_id, bc.row_id AS row_id, "
+            "bc.col_id AS col_id FROM date_cells AS dc "
+            "JOIN business_cells AS bc ON bc.cell_key_id = dc.cell_key_id "
+            "WHERE dc.effective_date = ? ORDER BY dc.cell_key_id",
+            (effective_date,),
+        ).fetchall()
+        return [
+            (int(r["cell_key_id"]), r["row_id"], r["col_id"]) for r in rows
+        ]
+
+    def _preview_one_cell(
+        self,
+        *,
+        cell_key_id: int | None,
+        row_id: str,
+        col_id: str,
+        effective_date: str,
+        batch_no: int,
+        action: str,
+        new_fact: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Diff one cell around *effective_date*.
+
+        Only dates in ``[D, next date after D)`` can change, because the
+        operation rewrites exactly date ``D`` and dates after ``D`` are the
+        same in both maps.  Admitted cells therefore need one interval, not a
+        per-day walk.
+        """
+
+        old_root = 0 if cell_key_id is None else self._current_root(cell_key_id)
+
+        old_node = self._predecessor(old_root, effective_date)
+        before = (
+            _answer_from_node(old_node)
+            if old_node is not None
+            else _no_record_answer()
+        )
+
+        if new_fact is not None:
+            after = _answer_from_fact(new_fact, effective_date)
+        else:
+            previous_node = self._predecessor_strict(old_root, effective_date)
+            after = (
+                _answer_from_node(previous_node)
+                if previous_node is not None
+                else _no_record_answer()
+            )
+
+        if before == after:
+            return None
+
+        successor = self._successor_strict(old_root, effective_date)
+        end = None if successor is None else successor["key"]
+
+        return {
+            "record_type": "archive_impact",
+            "action": action,
+            "batch_no": batch_no,
+            "effective_date": effective_date,
+            "row_id": row_id,
+            "col_id": col_id,
+            "interval": {"start": effective_date, "end": end},
+            "before": before,
+            "after": after,
+        }
+
+
+def _no_record_answer() -> dict[str, Any]:
+    return {"found": False, "result": "no_record"}
+
+
+def _answer_from_fact(
+    fact: dict[str, Any], effective_date: str
+) -> dict[str, Any]:
+    """Shape a stored fact like one single-cell query answer (no evidence)."""
+
+    out: dict[str, Any] = {
+        "found": True,
+        "status": fact["status"],
+        "text": fact.get("text"),
+        "effective_date": effective_date,
+        "ingest_batch_no": fact["roster_batch_no"],
+        "page_id": fact.get("page_id"),
+        "page_no": fact.get("page_no"),
+        "cell_id": fact.get("cell_id"),
+        "row_no": fact.get("row_no"),
+        "col_no": fact.get("col_no"),
+    }
+    if fact["status"] == "undecidable":
+        out["reasons"] = fact.get("reasons", [])
+    return out
+
+
+def _answer_from_node(node: sqlite3.Row) -> dict[str, Any]:
+    return _answer_from_fact(json.loads(node["fact_json"]), node["key"])
+
 
 # ----------------------------------------------------------------------
 # Module-level entry points
@@ -819,3 +1060,74 @@ def list_batches(archive_path: str | os.PathLike[str]) -> dict[str, Any]:
         }
     finally:
         store.close()
+
+
+def preview(
+    archive_path: str | os.PathLike[str],
+    *,
+    batch_no: int,
+    effective_date: str,
+    action: str = "submit",
+    roster_path: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Read-only preview of what one ingest would change, as JSONL diffs.
+
+    The roster (for ``submit``) is validated by the same reconstruction path
+    the real ingest uses.  The archive is opened read-only; no batch is added,
+    no persisted node is written, and no file is created if it was absent.
+    On any error nothing is emitted and the archive stays byte-for-byte intact.
+    """
+
+    if action not in {"submit", "retract"}:
+        raise ArchiveError(
+            "invalid_action", reason="action must be 'submit' or 'retract'"
+        )
+    batch = _normalize_batch(batch_no, field="batch_no")
+    date = _normalize_date(effective_date, field="effective_date")
+
+    if action == "submit" and roster_path is None:
+        raise ArchiveError(
+            "missing_roster", reason="submit requires a roster page description"
+        )
+    if action == "retract" and roster_path is not None:
+        raise ArchiveError(
+            "unexpected_roster", reason="retract does not take a roster"
+        )
+
+    if not Path(archive_path).exists():
+        raise ArchiveError(
+            "archive_not_found", reason="archive file does not exist"
+        )
+
+    staging: StagingStore | None = None
+    try:
+        if action == "submit":
+            # Same validator and privacy whitelist as the real ingest.
+            staging = _stage_roster(roster_path)  # type: ignore[arg-type]
+
+        store = ArchiveStore(archive_path, read_only=True)
+        try:
+            records = store.preview_operation(
+                batch_no=batch,
+                effective_date=date,
+                action=action,
+                staging=staging,
+            )
+            node_reads = store.node_reads
+        finally:
+            store.close()
+    finally:
+        if staging is not None:
+            staging.destroy()
+
+    return {
+        "status": "ok",
+        "archive": os.fspath(archive_path),
+        "action": action,
+        "batch_no": batch,
+        "effective_date": date,
+        "changed_cell_count": len(records),
+        "records": records,
+        "node_reads": node_reads,
+    }
+
